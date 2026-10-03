@@ -1,0 +1,68 @@
+# =============================================================================
+# Dockerfile.backend — 后端 API 镜像
+# 构建上下文：仓库根目录（docker compose 已配置 context: ..）
+# 约定契约：
+#   - backend workspace 名为 "backend"，构建脚本为 `npm run build --workspace=backend`
+#   - 构建产物为 backend/dist/server.js
+#   - backend 的 devDependencies 包含 prisma（启动时执行 db push 需要 CLI）
+# =============================================================================
+
+# ---- 构建阶段 ----
+FROM node:20-alpine AS builder
+
+# Prisma 在 alpine 上需要 openssl（引擎动态链接）
+RUN apk add --no-cache openssl
+
+WORKDIR /app
+
+# 先拷贝 workspace 清单，利用 Docker 层缓存（依赖不变时跳过 npm install）
+COPY package.json ./
+COPY shared/package.json ./shared/
+COPY backend/package.json ./backend/
+
+RUN npm install --workspace=backend --workspace=shared --include-workspace-root \
+    --no-audit --no-fund
+
+# 再拷贝源码与数据库定义
+COPY shared/ ./shared/
+COPY backend/ ./backend/
+COPY database/ ./database/
+
+# 生成 Prisma Client（读取 database/prisma/schema.prisma）
+RUN npx prisma generate --schema ./database/prisma/schema.prisma
+
+# 构建：先 shared（backend 依赖它的 dist），再 backend
+RUN npm run build --workspace=@monorepo/shared \
+ && npm run build --workspace=backend
+
+# ---- 运行阶段 ----
+FROM node:20-alpine
+
+RUN apk add --no-cache openssl wget
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# 从构建阶段拷贝：完整 node_modules（含 prisma CLI，供启动时 db push 用）、
+# 构建产物、prisma schema
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/shared/package.json ./shared/package.json
+COPY --from=builder /app/shared/dist ./shared/dist
+COPY --from=builder /app/backend/package.json ./backend/package.json
+COPY --from=builder /app/backend/dist ./backend/dist
+COPY --from=builder /app/database/prisma/schema.prisma ./database/prisma/schema.prisma
+
+# 启动脚本：先 prisma db push 同步表结构，再启动服务
+COPY deploy/docker-entrypoint.backend.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# SQLite 文件目录（compose 挂载 ./data 到 /data）
+RUN mkdir -p /data && chown -R node:node /app /data
+
+EXPOSE 4000
+
+# 非 root 运行
+USER node
+
+ENTRYPOINT ["docker-entrypoint.sh"]
